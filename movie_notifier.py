@@ -1,81 +1,131 @@
 import os
-import threading
 import time
+import threading
+import telebot
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
-import telebot
+from flask import Flask, request
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN)
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-WEBSITES = [
-    ("Bollyflix", "https://bollyflix.faith/search/{}"),
-    ("HDHub4u", "https://hdhub4u.gs/?s={}"),
-    ("Vegamovies Nagoya", "https://vegamovies.nagoya/?s={}"),
-    ("Vegamovies PK", "https://vegamovies.com.pk/?s={}")
-]
-
-movie_requests = {}
-
+bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Movie Notifier Bot is running!"
+WEBSITES = [
+    "https://bollyflix.faith/search/",
+    "https://hdhub4u.gs/?s=",
+    "https://vegamovies.nagoya/?s=",
+    "https://vegamovies.com.pk/?s="
+]
 
-def find_movie_links(movie_name):
-    encoded = movie_name.replace(" ", "+")
-    found = []
-    for name, template in WEBSITES:
+# movie_name → { "chat_id": int, "found_sites": set() }
+pending_movies = {}
+
+
+def check_movie_availability(movie_name, already_found):
+    new_links = []
+    for site in WEBSITES:
+        if site in already_found:
+            continue  # skip sites already found
+
+        search_url = site + movie_name.replace(" ", "+")
         try:
-            url = template.format(encoded)
-            resp = requests.get(url, timeout=10)
-            if resp.status_code != 200:
-                continue
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Example heuristic: check for <a> elements whose text contains the movie title
-            results = soup.find_all("a", text=lambda t: t and movie_name.lower() in t.lower())
-            if results:
-                found.append((name, url))
+            response = requests.get(search_url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Look for direct movie link
+            result_link = soup.find("a", href=True, text=lambda t: t and movie_name.lower() in t.lower())
+            if result_link:
+                new_links.append((site, result_link["href"]))
         except Exception as e:
-            print(f"Error checking {name} at {url}: {e}")
-    return found
+            print(f"Error checking {site}: {e}")
+    return new_links
+
 
 def background_checker():
     while True:
-        for chat_id, movie_name in list(movie_requests.items()):
-            found = find_movie_links(movie_name)
-            if found:
-                msg = f"🎉 '{movie_name}' is now available on:\n"
-                msg += "\n".join(f"{site}: {link}" for site, link in found)
-                bot.send_message(chat_id, msg)
-                del movie_requests[chat_id]
-        time.sleep(300)
+        time.sleep(120)  # check every 2 min
+        for movie_name, movie_data in list(pending_movies.items()):
+            chat_id = movie_data["chat_id"]
+            already_found = movie_data["found_sites"]
 
-@bot.message_handler(commands=['notify'])
-def handle_notify(message):
-    chat_id = message.chat.id
-    movie_name = message.text.split(" ", 1)
-    if len(movie_name) < 2 or not movie_name[1].strip():
-        bot.send_message(chat_id, "Usage: /notify <Movie Name>")
-        return
-    name = movie_name[1].strip()
-    bot.send_message(chat_id, f"Searching for '{name}'... 😊")
+            new_links = check_movie_availability(movie_name, already_found)
 
-    found = find_movie_links(name)
-    if found:
-        msg = f"🎉 '{name}' is already available on:\n"
-        msg += "\n".join(f"{site}: {link}" for site, link in found)
-        bot.send_message(chat_id, msg)
+            if new_links:
+                reply = f"🎉 *{movie_name}* new links found:\n"
+                for site, link in new_links:
+                    reply += f"🔗 [{site}]({link})\n"
+                    movie_data["found_sites"].add(site)
+
+                bot.send_message(chat_id, reply, parse_mode="Markdown")
+
+            # stop checking if user removed it manually
+            if movie_name not in pending_movies:
+                continue
+
+            # If all sites have been found, stop checking
+            if movie_data["found_sites"] == set(WEBSITES):
+                del pending_movies[movie_name]
+
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "Send me a movie name, I'll notify you when it's available!\nType /stop <movie name> to stop searching.")
+
+
+@bot.message_handler(commands=['stop'])
+def stop_search(message):
+    movie_name = message.text.replace("/stop", "").strip()
+    if movie_name in pending_movies:
+        del pending_movies[movie_name]
+        bot.reply_to(message, f"🛑 Stopped searching for *{movie_name}*.", parse_mode="Markdown")
     else:
-        movie_requests[chat_id] = name
-        bot.send_message(chat_id, f"Not found yet — I’ll keep searching until it's available.")
+        bot.reply_to(message, f"⚠️ No active search found for *{movie_name}*.", parse_mode="Markdown")
 
-def main():
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
-    threading.Thread(target=background_checker, daemon=True).start()
-    bot.infinity_polling()
+
+@bot.message_handler(func=lambda m: True)
+def handle_movie_search(message):
+    movie_name = message.text.strip()
+    links = check_movie_availability(movie_name, set())
+
+    if links:
+        reply = f"🎬 *{movie_name}* is available:\n"
+        found_sites = set()
+        for site, link in links:
+            reply += f"🔗 [{site}]({link})\n"
+            found_sites.add(site)
+
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+
+        # keep checking for other sites until user stops it
+        if found_sites != set(WEBSITES):
+            pending_movies[movie_name] = {"chat_id": message.chat.id, "found_sites": found_sites}
+
+    else:
+        bot.send_message(message.chat.id, f"⚠️ {movie_name} not available yet. I'll keep checking...")
+        pending_movies[movie_name] = {"chat_id": message.chat.id, "found_sites": set()}
+
+
+# Webhook route
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = request.get_data().decode("utf-8")
+    bot.process_new_updates([telebot.types.Update.de_json(update)])
+    return "OK", 200
+
+
+# Root route
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!", 200
+
 
 if __name__ == "__main__":
-    main()
+    # Start background checking
+    threading.Thread(target=background_checker, daemon=True).start()
+
+    # Set webhook for Telegram
+    bot.remove_webhook()
+    bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+    app.run(host="0.0.0.0", port=10000)
