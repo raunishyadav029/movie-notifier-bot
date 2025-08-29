@@ -1,71 +1,81 @@
-import os
-import time
+import telebot
 import requests
 from bs4 import BeautifulSoup
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
-import threading
+import time
+import os
 
-# Get the Telegram bot token from environment variable
+# Get bot token from environment variable
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(BOT_TOKEN)
 
 # List of websites to check
-WEBSITES = [
-    "https://hdhub4u.gs/",
-    "https://bollyflix.faith/",
-    "https://vegamovies.nagoya/",
-    "https://vegamovies.com.pk/"
+websites = [
+    "https://bollyflix.faith",
+    "https://hdhub4u.gs",
+    "https://vegamovies.nagoya",
+    "https://vegamovies.com.pk"
 ]
 
-CHECK_INTERVAL = 300  # 5 minutes
+# To store ongoing searches
+active_searches = {}
 
-# Function to search movie on all websites
-def search_movie(movie_name):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for site in WEBSITES:
-        search_url = site + "search/" + movie_name.replace(" ", "+")
+def movie_available(movie_name):
+    """Check all websites for the movie."""
+    for site in websites:
         try:
-            resp = requests.get(search_url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Check if movie name exists on the page
+            search_url = f"{site}/search/{movie_name.replace(' ', '%20')}"
+            response = requests.get(search_url, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
                 if movie_name.lower() in soup.get_text().lower():
-                    return site
-        except Exception as e:
-            print(f"Error checking {site}: {e}")
+                    return site  # Return the site where it's found
+        except Exception:
+            continue
     return None
 
-# Function to check periodically until movie is found
-def periodic_check(movie_name, chat_id, bot):
-    while True:
-        site = search_movie(movie_name)
-        if site:
-            bot.send_message(chat_id, f"🎉 '{movie_name}' is now available on {site}")
-            break
-        time.sleep(CHECK_INTERVAL)
 
-# Command handler for /notify
-def notify(update: Update, context: CallbackContext):
-    if len(context.args) == 0:
-        update.message.reply_text("Please provide a movie name. Example: /notify Animal")
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "Welcome! Use /notify <movie_name> to get notified when the movie is available.")
+
+
+@bot.message_handler(commands=['notify'])
+def notify_movie(message):
+    chat_id = message.chat.id
+    try:
+        movie_name = message.text.split(" ", 1)[1].strip()
+    except IndexError:
+        bot.reply_to(chat_id, "Please provide a movie name. Example: /notify Animal")
         return
-    movie_name = " ".join(context.args)
 
-    # Check instantly first
-    site = search_movie(movie_name)
-    if site:
-        update.message.reply_text(f"🎉 '{movie_name}' is already available on {site}")
+    bot.reply_to(chat_id, f"Searching for '{movie_name}'... I'll notify you when it's available!")
+
+    # Instant check first
+    site_found = movie_available(movie_name)
+    if site_found:
+        bot.send_message(chat_id, f"✅ '{movie_name}' is available now on {site_found}!")
+        return
+
+    # If not found, keep checking every 5 minutes until found
+    active_searches[chat_id] = movie_name
+    while chat_id in active_searches:
+        site_found = movie_available(movie_name)
+        if site_found:
+            bot.send_message(chat_id, f"✅ '{movie_name}' is available now on {site_found}!")
+            del active_searches[chat_id]  # Stop checking after notification
+            break
+        time.sleep(300)  # Check every 5 minutes
+
+
+@bot.message_handler(commands=['stop'])
+def stop_search(message):
+    chat_id = message.chat.id
+    if chat_id in active_searches:
+        del active_searches[chat_id]
+        bot.reply_to(chat_id, "Stopped searching for your movie.")
     else:
-        update.message.reply_text(f"🔍 '{movie_name}' not found yet. Will notify when available.")
-        # Start background thread for periodic checks
-        threading.Thread(target=periodic_check, args=(movie_name, update.message.chat_id, context.bot)).start()
+        bot.reply_to(chat_id, "You have no active searches.")
 
-def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("notify", notify))
-    updater.start_polling()
-    updater.idle()
 
-if __name__ == "__main__":
-    main()
+print("Bot is running...")
+bot.polling()
