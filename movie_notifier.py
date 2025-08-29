@@ -3,83 +3,79 @@ import threading
 import time
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request
+from flask import Flask
 import telebot
 
-# Load Telegram Bot Token from environment variables
-TOKEN = os.environ.get("BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# List of websites to check
 WEBSITES = [
-    "https://bollyflix.faith/search/",
-    "https://hdhub4u.gs/?s=",
-    "https://vegamovies.nagoya/?s=",
-    "https://vegamovies.com.pk/?s="
+    ("Bollyflix", "https://bollyflix.faith/search/{}"),
+    ("HDHub4u", "https://hdhub4u.gs/?s={}"),
+    ("Vegamovies Nagoya", "https://vegamovies.nagoya/?s={}"),
+    ("Vegamovies PK", "https://vegamovies.com.pk/?s={}")
 ]
 
-# Movie tracking dictionary
 movie_requests = {}
 
-# Flask app for Render
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Movie Notifier Bot with Webhook is Running!"
+    return "Movie Notifier Bot is running!"
 
-# Function to check if movie exists
-def check_movie(movie_name):
-    movie_name_encoded = movie_name.replace(" ", "+")
-    for site in WEBSITES:
-        url = site + movie_name_encoded
+def find_movie_links(movie_name):
+    encoded = movie_name.replace(" ", "+")
+    found = []
+    for name, template in WEBSITES:
         try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200 and movie_name.lower() in response.text.lower():
-                return url
-        except:
-            pass
-    return None
+            url = template.format(encoded)
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Example heuristic: check for <a> elements whose text contains the movie title
+            results = soup.find_all("a", text=lambda t: t and movie_name.lower() in t.lower())
+            if results:
+                found.append((name, url))
+        except Exception as e:
+            print(f"Error checking {name} at {url}: {e}")
+    return found
 
-# Background checker
-def movie_checker():
+def background_checker():
     while True:
         for chat_id, movie_name in list(movie_requests.items()):
-            result_url = check_movie(movie_name)
-            if result_url:
-                bot.send_message(chat_id, f"🎉 '{movie_name}' is now available!\nCheck here: {result_url}")
+            found = find_movie_links(movie_name)
+            if found:
+                msg = f"🎉 '{movie_name}' is now available on:\n"
+                msg += "\n".join(f"{site}: {link}" for site, link in found)
+                bot.send_message(chat_id, msg)
                 del movie_requests[chat_id]
         time.sleep(300)
 
-# Telegram command
 @bot.message_handler(commands=['notify'])
-def notify(message):
+def handle_notify(message):
     chat_id = message.chat.id
-    movie_name = message.text.replace("/notify", "").strip()
-    if not movie_name:
-        bot.send_message(chat_id, "❌ Please enter a movie name. Example: /notify Animal")
+    movie_name = message.text.split(" ", 1)
+    if len(movie_name) < 2 or not movie_name[1].strip():
+        bot.send_message(chat_id, "Usage: /notify <Movie Name>")
         return
+    name = movie_name[1].strip()
+    bot.send_message(chat_id, f"Searching for '{name}'... 😊")
 
-    result_url = check_movie(movie_name)
-    if result_url:
-        bot.send_message(chat_id, f"🎉 '{movie_name}' is already available!\nCheck here: {result_url}")
+    found = find_movie_links(name)
+    if found:
+        msg = f"🎉 '{name}' is already available on:\n"
+        msg += "\n".join(f"{site}: {link}" for site, link in found)
+        bot.send_message(chat_id, msg)
     else:
-        movie_requests[chat_id] = movie_name
-        bot.send_message(chat_id, f"🔔 I will notify you when '{movie_name}' is available.")
+        movie_requests[chat_id] = name
+        bot.send_message(chat_id, f"Not found yet — I’ll keep searching until it's available.")
 
-# Webhook route for Telegram
-@app.route(f'/{TOKEN}', methods=['POST'])
-def webhook():
-    update = request.stream.read().decode("utf-8")
-    bot.process_new_updates([telebot.types.Update.de_json(update)])
-    return "OK", 200
+def main():
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
+    threading.Thread(target=background_checker, daemon=True).start()
+    bot.infinity_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=movie_checker).start()
-    
-    # Set webhook for Telegram
-    url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
-    bot.remove_webhook()
-    bot.set_webhook(url=url)
-    
-    app.run(host="0.0.0.0", port=10000)
+    main()
