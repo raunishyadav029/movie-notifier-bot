@@ -1,81 +1,78 @@
-import telebot
+import os
+import threading
+import time
 import requests
 from bs4 import BeautifulSoup
-import time
-import os
+from flask import Flask
+import telebot
 
-# Get bot token from environment variable
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN)
+# Load Telegram Bot Token from environment variables
+TOKEN = os.environ.get("BOT_TOKEN")
+bot = telebot.TeleBot(TOKEN)
 
 # List of websites to check
-websites = [
-    "https://bollyflix.faith",
-    "https://hdhub4u.gs",
-    "https://vegamovies.nagoya",
-    "https://vegamovies.com.pk"
+WEBSITES = [
+    "https://bollyflix.faith/search/",
+    "https://hdhub4u.gs/?s=",
+    "https://vegamovies.nagoya/?s=",
+    "https://vegamovies.com.pk/?s="
 ]
 
-# To store ongoing searches
-active_searches = {}
+# Movie tracking dictionary
+movie_requests = {}
 
-def movie_available(movie_name):
-    """Check all websites for the movie."""
-    for site in websites:
+# Flask app to keep the service alive on Render
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Movie Notifier Bot is Running!"
+
+# Function to check if movie exists on any website
+def check_movie(movie_name):
+    movie_name_encoded = movie_name.replace(" ", "+")
+    for site in WEBSITES:
+        url = site + movie_name_encoded
         try:
-            search_url = f"{site}/search/{movie_name.replace(' ', '%20')}"
-            response = requests.get(search_url, timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                if movie_name.lower() in soup.get_text().lower():
-                    return site  # Return the site where it's found
-        except Exception:
-            continue
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200 and movie_name.lower() in response.text.lower():
+                return url
+        except Exception as e:
+            print(f"Error checking {site}: {e}")
     return None
 
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "Welcome! Use /notify <movie_name> to get notified when the movie is available.")
-
-
-@bot.message_handler(commands=['notify'])
-def notify_movie(message):
-    chat_id = message.chat.id
-    try:
-        movie_name = message.text.split(" ", 1)[1].strip()
-    except IndexError:
-        bot.reply_to(chat_id, "Please provide a movie name. Example: /notify Animal")
-        return
-
-    bot.reply_to(chat_id, f"Searching for '{movie_name}'... I'll notify you when it's available!")
-
-    # Instant check first
-    site_found = movie_available(movie_name)
-    if site_found:
-        bot.send_message(chat_id, f"✅ '{movie_name}' is available now on {site_found}!")
-        return
-
-    # If not found, keep checking every 5 minutes until found
-    active_searches[chat_id] = movie_name
-    while chat_id in active_searches:
-        site_found = movie_available(movie_name)
-        if site_found:
-            bot.send_message(chat_id, f"✅ '{movie_name}' is available now on {site_found}!")
-            del active_searches[chat_id]  # Stop checking after notification
-            break
+# Background process to keep checking movie availability
+def movie_checker():
+    while True:
+        for chat_id, movie_name in list(movie_requests.items()):
+            result_url = check_movie(movie_name)
+            if result_url:
+                bot.send_message(chat_id, f"🎉 '{movie_name}' is now available!\nCheck here: {result_url}")
+                del movie_requests[chat_id]  # Stop checking once found
         time.sleep(300)  # Check every 5 minutes
 
-
-@bot.message_handler(commands=['stop'])
-def stop_search(message):
+# Telegram command to start notifications
+@bot.message_handler(commands=['notify'])
+def notify(message):
     chat_id = message.chat.id
-    if chat_id in active_searches:
-        del active_searches[chat_id]
-        bot.reply_to(chat_id, "Stopped searching for your movie.")
+    movie_name = message.text.replace("/notify", "").strip()
+    if not movie_name:
+        bot.send_message(chat_id, "❌ Please enter a movie name. Example: /notify Animal")
+        return
+
+    # Instant check
+    result_url = check_movie(movie_name)
+    if result_url:
+        bot.send_message(chat_id, f"🎉 '{movie_name}' is already available!\nCheck here: {result_url}")
     else:
-        bot.reply_to(chat_id, "You have no active searches.")
+        movie_requests[chat_id] = movie_name
+        bot.send_message(chat_id, f"🔔 I will notify you when '{movie_name}' is available.")
 
+# Start Telegram bot in a separate thread
+def start_bot():
+    bot.infinity_polling()
 
-print("Bot is running...")
-bot.polling()
+if __name__ == "__main__":
+    threading.Thread(target=start_bot).start()
+    threading.Thread(target=movie_checker).start()
+    app.run(host="0.0.0.0", port=10000)
